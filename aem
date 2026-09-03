@@ -1,0 +1,745 @@
+#!/usr/bin/env bash
+#
+# aem — local runtime CLI for AEM as a Cloud Service (Author, Publish,
+# Dispatcher, Universal Editor Service, HTTPS). Infrastructure only: it
+# never touches your AEM project.
+#
+# The AEM SDK is always user-supplied and never downloaded. Runmode/port
+# are encoded in the quickstart jar's filename, per Adobe's documented
+# local setup procedure. Debug ports follow "3<port>" (see Adobe's remote
+# debugging docs). crx-quickstart is treated as disposable, regeneratable
+# state.
+#
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+ENV_FILE="$ROOT/.env"
+ENV_EXAMPLE="$ROOT/config/.env.example"
+SDK_DIR="$ROOT/sdk"
+UES_DIR="$ROOT/ues"
+INSTANCES_DIR="$ROOT/instances"
+CERTS_DIR="$ROOT/certs"
+RUN_DIR="$INSTANCES_DIR/run"
+DISPATCHER_DIR="$ROOT/dispatcher"
+OSGI_DIR="$ROOT/config/osgi"
+
+log()  { echo "[aem] $*"; }
+err()  { echo "[aem] ERROR: $*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# .env
+# ---------------------------------------------------------------------------
+
+load_env() {
+  if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+  fi
+
+  AEM_AUTHOR_PORT="${AEM_AUTHOR_PORT:-4502}"
+  AEM_PUBLISH_PORT="${AEM_PUBLISH_PORT:-4503}"
+  DISPATCHER_PORT="${DISPATCHER_PORT:-8080}"
+  UES_PORT="${UES_PORT:-8000}"
+  SSL_AUTHOR_PORT="${SSL_AUTHOR_PORT:-8443}"
+  SSL_PUBLISH_PORT="${SSL_PUBLISH_PORT:-8444}"
+  CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-https://localhost:3000}"
+  CORS_ALLOWED_ORIGINS_AUTHOR="${CORS_ALLOWED_ORIGINS_AUTHOR:-$CORS_ALLOWED_ORIGINS}"
+  CORS_ALLOWED_ORIGINS_PUBLISH="${CORS_ALLOWED_ORIGINS_PUBLISH:-$CORS_ALLOWED_ORIGINS}"
+  DISPATCHER_SRC_DIR="${DISPATCHER_SRC_DIR:-$DISPATCHER_DIR/src}"
+}
+
+# ---------------------------------------------------------------------------
+# Java 21 resolution — the AEM SDK requires Java 21 (Adobe maintenance
+# release 2026.2.0, SKYOPS-123327). We never assume `java` on PATH is it.
+# ---------------------------------------------------------------------------
+
+resolve_java() {
+  JAVA_BIN=""
+  if [[ -n "${AEM_JAVA_HOME:-}" ]]; then
+    JAVA_BIN="$AEM_JAVA_HOME/bin/java"
+  elif command -v /usr/libexec/java_home >/dev/null 2>&1 && /usr/libexec/java_home -v 21 >/dev/null 2>&1; then
+    JAVA_BIN="$(/usr/libexec/java_home -v 21)/bin/java"
+  elif [[ -d "$HOME/.sdkman/candidates/java" ]]; then
+    local cand
+    cand=$(find "$HOME/.sdkman/candidates/java" -maxdepth 1 -iname '21*' -type d 2>/dev/null | sort -V | tail -1)
+    [[ -n "$cand" ]] && JAVA_BIN="$cand/bin/java"
+  fi
+  [[ -z "$JAVA_BIN" ]] && command -v java >/dev/null 2>&1 && JAVA_BIN="$(command -v java)"
+  [[ -z "$JAVA_BIN" ]] && die "No Java installation found. Install Java 21 or set AEM_JAVA_HOME in .env."
+
+  if ! "$JAVA_BIN" -version 2>&1 | head -1 | grep -q '"21\.'; then
+    die "Java 21 is required by the AEM SDK, but $JAVA_BIN is: $("$JAVA_BIN" -version 2>&1 | head -1). Set AEM_JAVA_HOME in .env to a JDK 21 install (e.g. via sdkman: ~/.sdkman/candidates/java/21.x.x-tem)."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# AEM SDK detection / extraction — never bundled, never downloaded.
+# ---------------------------------------------------------------------------
+
+sdk_not_found_die() {
+  cat >&2 <<'MSG'
+AEM SDK not found.
+
+Download the AEM SDK from Adobe Software Distribution
+and place the Quickstart JAR inside ./sdk/
+MSG
+  exit 1
+}
+
+find_sdk_zip()  { find "$SDK_DIR" -maxdepth 1 -iname 'aem-sdk-*.zip' -type f 2>/dev/null | sort -V | tail -1; }
+find_loose_jar() { find "$SDK_DIR" -maxdepth 1 -iname '*quickstart*.jar' -type f 2>/dev/null | sort -V | tail -1; }
+
+ensure_quickstart_jar() {
+  QUICKSTART_JAR="$SDK_DIR/.extracted/quickstart.jar"
+  [[ -f "$QUICKSTART_JAR" ]] && return 0
+
+  mkdir -p "$SDK_DIR/.extracted"
+
+  local loose
+  loose=$(find_loose_jar)
+  if [[ -n "$loose" ]]; then
+    cp "$loose" "$QUICKSTART_JAR"
+    log "Using quickstart jar: $(basename "$loose")"
+    return 0
+  fi
+
+  local zip
+  zip=$(find_sdk_zip)
+  [[ -z "$zip" ]] && sdk_not_found_die
+
+  local entry
+  entry=$(unzip -Z1 "$zip" | grep -i 'quickstart.*\.jar$' | head -1 || true)
+  [[ -z "$entry" ]] && die "Could not find a quickstart jar inside $(basename "$zip")"
+
+  unzip -o -j "$zip" "$entry" -d "$SDK_DIR/.extracted" >/dev/null
+  mv "$SDK_DIR/.extracted/$(basename "$entry")" "$QUICKSTART_JAR"
+  log "Extracted quickstart jar from $(basename "$zip")"
+}
+
+ensure_dispatcher_tools() {
+  local extracted="$SDK_DIR/.extracted/dispatcher-tools"
+  mkdir -p "$extracted"
+  DISPATCHER_TOOLS_DIR=$(find "$extracted" -maxdepth 1 -iname 'dispatcher-sdk-*' -type d 2>/dev/null | sort -V | tail -1 || true)
+  [[ -n "$DISPATCHER_TOOLS_DIR" && -x "$DISPATCHER_TOOLS_DIR/bin/docker_run.sh" ]] && return 0
+
+  local zip
+  zip=$(find_sdk_zip)
+  [[ -z "$zip" ]] && sdk_not_found_die
+
+  local installer
+  installer=$(unzip -Z1 "$zip" | grep -i 'dispatcher-tools.*unix\.sh$' | head -1 || true)
+  [[ -z "$installer" ]] && die "Could not find the dispatcher tools installer (aem-sdk-dispatcher-tools-*-unix.sh) inside $(basename "$zip")"
+
+  mkdir -p "$extracted"
+  unzip -o -j "$zip" "$installer" -d "$extracted" >/dev/null
+  local sh_file="$extracted/$(basename "$installer")"
+  chmod +x "$sh_file"
+  log "Running dispatcher tools installer (this is Adobe's own installer, unmodified)"
+  ( cd "$extracted" && ./"$(basename "$sh_file")" < /dev/null )
+  rm -f "$sh_file"
+
+  DISPATCHER_TOOLS_DIR=$(find "$extracted" -maxdepth 1 -iname 'dispatcher-sdk-*' -type d 2>/dev/null | sort -V | tail -1 || true)
+  [[ -z "$DISPATCHER_TOOLS_DIR" ]] && die "Dispatcher tools installer did not produce the expected dispatcher-sdk-* directory"
+}
+
+ensure_dispatcher_src() {
+  ensure_dispatcher_tools
+  if [[ ! -d "$DISPATCHER_SRC_DIR" || -z "$(ls -A "$DISPATCHER_SRC_DIR" 2>/dev/null)" ]]; then
+    # Adobe's update_maven.sh turns out to be a sync tool for a project that
+    # already has a dispatcher/src (it errors on an empty target). What we
+    # actually want for a fresh baseline is the src/ tree Adobe ships
+    # alongside the tools themselves — a complete, working default
+    # farm/vhost pair with enabled_* already symlinked to available_*.
+    mkdir -p "$(dirname "$DISPATCHER_SRC_DIR")"
+    log "Copying Adobe's baseline Dispatcher config to $DISPATCHER_SRC_DIR"
+    cp -R "$DISPATCHER_TOOLS_DIR/src" "$DISPATCHER_SRC_DIR"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Universal Editor Service detection / extraction — never bundled/downloaded.
+# ---------------------------------------------------------------------------
+
+ues_not_found_die() {
+  cat >&2 <<'MSG'
+Universal Editor Service not found.
+
+Download the Universal Editor Service from Adobe Software Distribution
+and place the zip (or the .cjs file) inside ./ues/
+MSG
+  exit 1
+}
+
+ensure_ues_cjs() {
+  UES_CJS="$UES_DIR/.extracted/universal-editor-service.cjs"
+  [[ -f "$UES_CJS" ]] && return 0
+
+  mkdir -p "$UES_DIR/.extracted"
+
+  local loose
+  loose=$(find "$UES_DIR" -maxdepth 1 -iname '*.cjs' -type f 2>/dev/null | sort -V | tail -1)
+  if [[ -n "$loose" ]]; then
+    cp "$loose" "$UES_CJS"
+    return 0
+  fi
+
+  local zip
+  zip=$(find "$UES_DIR" -maxdepth 1 -iname 'universal-editor-service*.zip' -type f 2>/dev/null | sort -V | tail -1)
+  [[ -z "$zip" ]] && ues_not_found_die
+
+  unzip -o -j "$zip" '*.cjs' -d "$UES_DIR/.extracted" >/dev/null
+  local produced
+  produced=$(find "$UES_DIR/.extracted" -maxdepth 1 -iname '*.cjs' ! -name 'universal-editor-service.cjs' -type f | head -1)
+  [[ -n "$produced" ]] && mv "$produced" "$UES_CJS"
+  [[ -f "$UES_CJS" ]] || die "Could not find a .cjs file inside $(basename "$zip")"
+}
+
+# ---------------------------------------------------------------------------
+# TLS certificate (self-signed, local dev only)
+# ---------------------------------------------------------------------------
+
+ensure_certs() {
+  mkdir -p "$CERTS_DIR"
+  [[ -f "$CERTS_DIR/certificate.pem" && -f "$CERTS_DIR/key.pem" ]] && return 0
+  command -v openssl >/dev/null 2>&1 || die "openssl is required to generate local certificates."
+  log "Generating a self-signed certificate for local HTTPS (certs/, gitignored)"
+  openssl req -newkey rsa:2048 -nodes \
+    -keyout "$CERTS_DIR/key.pem" -x509 -days 825 \
+    -out "$CERTS_DIR/certificate.pem" \
+    -subj "/CN=localhost" \
+    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# OSGi infra configuration — rendered into crx-quickstart/install/, which
+# Sling's file installer watches: add -> install, rewrite -> update,
+# delete -> remove. Rewriting the same file each run is what makes this
+# idempotent.
+# ---------------------------------------------------------------------------
+
+csv_to_json_array() {
+  local csv="$1" item out=()
+  local IFS=','
+  for item in $csv; do
+    item="$(echo "$item" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [[ -n "$item" ]] && out+=("\"$item\"")
+  done
+  local joined
+  joined=$(IFS=,; echo "${out[*]}")
+  echo "[$joined]"
+}
+
+render_osgi_configs() {
+  local tier="$1" install_dir="$2"
+  mkdir -p "$install_dir"
+
+  local origins_var origins origins_json
+  origins_var="CORS_ALLOWED_ORIGINS_$(echo "$tier" | tr '[:lower:]' '[:upper:]')"
+  origins="${!origins_var}"
+  origins_json=$(csv_to_json_array "$origins")
+
+  sed "s|__CORS_ORIGINS_JSON__|$origins_json|" \
+    "$OSGI_DIR/cors.${tier}.cfg.json.tmpl" \
+    > "$install_dir/com.adobe.granite.cors.impl.CORSPolicyImpl~aem-local.cfg.json"
+
+  if [[ "$tier" == "author" ]]; then
+    # Removes X-Frame-Options: SAMEORIGIN so the Universal Editor can iframe
+    # Author. PID + property confirmed against current Adobe docs.
+    cp "$OSGI_DIR/x-frame-options.cfg.json.tmpl" \
+       "$install_dir/org.apache.sling.engine.impl.SlingMainServlet.cfg.json"
+
+    # PID intentionally uses the doubled "impl.impl" segment: it's the
+    # real, metatype-backed component ("Adobe Granite Token
+    # Authentication Handler"). The single-impl spelling is an orphan PID
+    # with no bundle behind it.
+    cp "$OSGI_DIR/token-auth-samesite.cfg.json.tmpl" \
+       "$install_dir/com.day.crx.security.token.impl.impl.TokenAuthenticationHandler.cfg.json"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Process helpers (pidfile-based; same code path native or in-container)
+# ---------------------------------------------------------------------------
+
+pid_file() { echo "$RUN_DIR/$1.pid"; }
+
+is_running() {
+  local pf; pf=$(pid_file "$1")
+  [[ -f "$pf" ]] || return 1
+  kill -0 "$(cat "$pf")" 2>/dev/null
+}
+
+stop_service() {
+  local svc="$1"
+  if is_running "$svc"; then
+    local pid; pid=$(cat "$(pid_file "$svc")")
+    log "Stopping $svc (pid $pid)"
+    kill "$pid" 2>/dev/null || true
+    local i
+    for i in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.5
+    done
+    kill -9 "$pid" 2>/dev/null || true
+  else
+    log "$svc is not running"
+  fi
+  rm -f "$(pid_file "$svc")"
+}
+
+# ---------------------------------------------------------------------------
+# Author / Publish
+# ---------------------------------------------------------------------------
+
+tier_port() {
+  case "$1" in
+    author) echo "$AEM_AUTHOR_PORT" ;;
+    publish) echo "$AEM_PUBLISH_PORT" ;;
+  esac
+}
+
+instance_jar_path() {
+  local tier="$1" port
+  port=$(tier_port "$tier")
+  echo "$INSTANCES_DIR/$tier/aem-${tier}-p${port}.jar"
+}
+
+# Portable inode number, GNU (Linux/devcontainer) or BSD (macOS) stat.
+inode_of() {
+  stat -c '%i' "$1" 2>/dev/null || stat -f '%i' "$1" 2>/dev/null
+}
+
+ensure_instance_jar() {
+  local tier="$1" target
+  ensure_quickstart_jar
+  mkdir -p "$INSTANCES_DIR/$tier"
+  target=$(instance_jar_path "$tier")
+  # drop a stale file left over from a previous port
+  find "$INSTANCES_DIR/$tier" -maxdepth 1 -iname "aem-${tier}-p*.jar" ! -name "$(basename "$target")" -delete 2>/dev/null || true
+
+  # Each instance gets its own independent physical copy of the jar — not
+  # a symlink or hard link. Adobe's setup procedure has you copy the
+  # quickstart jar into a separate folder per tier; a shared file breaks
+  # this, because the Quickstart launcher resolves the jar's canonical
+  # path to decide its own install location. Two hard links to the same
+  # inode still resolve to that same canonical path, so author and
+  # publish would collide in sdk/.extracted/ instead of each running from
+  # its own directory. Costs ~480MB extra disk per instance.
+  if [[ -f "$target" ]] && [[ "$(inode_of "$target")" == "$(inode_of "$QUICKSTART_JAR")" ]]; then
+    rm -f "$target"  # replace a shared-link jar from an older layout
+  fi
+  [[ -f "$target" ]] || cp "$QUICKSTART_JAR" "$target"
+}
+
+# Author's out-of-the-box default replication agent ships disabled, with
+# placeholder values ("http://host:port/..."), so publishing content does
+# nothing on a fresh SDK instance until it's configured. Runs in the
+# background (Author's HTTP API isn't up for minutes after the process
+# starts, and start_instance shouldn't block that long) and retries until
+# it succeeds, since AEM readiness isn't otherwise signaled.
+configure_replication() {
+  local url="http://localhost:${AEM_AUTHOR_PORT}/etc/replication/agents.author/publish/jcr:content"
+  local transport="http://localhost:${AEM_PUBLISH_PORT}/bin/receive?sling:authRequestLogin=1"
+  local attempt code
+  for attempt in $(seq 1 90); do
+    # `|| code="000"` is required here: curl refuses to connect on every
+    # attempt before Author's HTTP port opens, and under `set -e` a bare
+    # failing assignment would abort this whole function on the first
+    # try instead of continuing the retry loop.
+    code=$(curl -sS -m 5 -u admin:admin -o /dev/null -w '%{http_code}' \
+      -F "enabled=true" \
+      -F "transportUri=${transport}" \
+      -F "transportUser=admin" \
+      -F "transportPassword=admin" \
+      -F "userId=admin" \
+      "$url" 2>/dev/null) || code="000"
+    if [[ "$code" == "200" || "$code" == "201" ]]; then
+      log "Replication agent (author -> publish) configured: $transport"
+      return 0
+    fi
+    sleep 5
+  done
+  log "Warning: could not configure the author->publish replication agent after several minutes (is Author fully booted? check: ./aem logs author). Re-run: ./aem start author"
+}
+
+start_instance() {
+  local tier="$1"
+  if is_running "$tier"; then
+    log "$tier is already running"
+    return 0
+  fi
+  resolve_java
+  ensure_instance_jar "$tier"
+
+  local port debug_port jar
+  port=$(tier_port "$tier")
+  debug_port="3${port}"
+  jar=$(instance_jar_path "$tier")
+
+  mkdir -p "$RUN_DIR"
+  log "Starting $tier on :$port (remote debug :$debug_port)"
+  (
+    cd "$INSTANCES_DIR/$tier"
+    nohup "$JAVA_BIN" \
+      "-agentlib:jdwp=transport=dt_socket,address=*:${debug_port},server=y,suspend=n" \
+      -jar "$(basename "$jar")" \
+      -nofork -nobrowser -nointeractive \
+      > "$RUN_DIR/${tier}.out" 2>&1 &
+    echo $! > "$RUN_DIR/${tier}.pid"
+  )
+
+  local cq="$INSTANCES_DIR/$tier/crx-quickstart" waited=0
+  while [[ ! -d "$cq" && $waited -lt 30 ]]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if [[ -d "$cq" ]]; then
+    render_osgi_configs "$tier" "$cq/install"
+  else
+    log "Warning: crx-quickstart not created yet for $tier — OSGi configs will apply on the next start/restart"
+  fi
+
+  if [[ "$tier" == "author" ]]; then
+    mkdir -p "$RUN_DIR"
+    ( configure_replication ) >> "$RUN_DIR/replication.out" 2>&1 &
+    disown 2>/dev/null || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Universal Editor Service (serves HTTPS itself — no proxy needed)
+# ---------------------------------------------------------------------------
+
+start_ues() {
+  if is_running ues; then
+    log "ues is already running"
+    return 0
+  fi
+  command -v node >/dev/null 2>&1 || die "Node.js is required for the Universal Editor Service (Adobe currently requires Node 20)."
+  ensure_ues_cjs
+  ensure_certs
+  mkdir -p "$INSTANCES_DIR/ues" "$RUN_DIR"
+  log "Starting Universal Editor Service on :$UES_PORT (HTTPS)"
+  (
+    cd "$INSTANCES_DIR/ues"
+    export UES_PORT="$UES_PORT"
+    export UES_CERT="$CERTS_DIR/certificate.pem"
+    export UES_PRIVATE_KEY="$CERTS_DIR/key.pem"
+    export UES_TLS_REJECT_UNAUTHORIZED=false
+    export UES_CORS_PRIVATE_NETWORK=true
+    nohup node "$UES_CJS" > "$RUN_DIR/ues.out" 2>&1 &
+    echo $! > "$RUN_DIR/ues.pid"
+  )
+}
+
+# ---------------------------------------------------------------------------
+# HTTPS proxy in front of Author/Publish (Adobe documents local-ssl-proxy
+# in its Universal Editor learn tutorials for this exact purpose).
+# ---------------------------------------------------------------------------
+
+start_ssl() {
+  command -v npx >/dev/null 2>&1 || die "Node.js/npx is required for local-ssl-proxy."
+  ensure_certs
+  mkdir -p "$RUN_DIR"
+  if ! is_running ssl-author; then
+    log "HTTPS proxy: https://localhost:${SSL_AUTHOR_PORT} -> http://localhost:${AEM_AUTHOR_PORT} (author)"
+    nohup npx --yes local-ssl-proxy@2 --source "$SSL_AUTHOR_PORT" --target "$AEM_AUTHOR_PORT" \
+      --cert "$CERTS_DIR/certificate.pem" --key "$CERTS_DIR/key.pem" \
+      > "$RUN_DIR/ssl-author.out" 2>&1 &
+    echo $! > "$RUN_DIR/ssl-author.pid"
+  fi
+  if ! is_running ssl-publish; then
+    log "HTTPS proxy: https://localhost:${SSL_PUBLISH_PORT} -> http://localhost:${AEM_PUBLISH_PORT} (publish)"
+    nohup npx --yes local-ssl-proxy@2 --source "$SSL_PUBLISH_PORT" --target "$AEM_PUBLISH_PORT" \
+      --cert "$CERTS_DIR/certificate.pem" --key "$CERTS_DIR/key.pem" \
+      > "$RUN_DIR/ssl-publish.out" 2>&1 &
+    echo $! > "$RUN_DIR/ssl-publish.pid"
+  fi
+}
+
+stop_ssl() {
+  stop_service ssl-author
+  stop_service ssl-publish
+}
+
+# ---------------------------------------------------------------------------
+# Dispatcher — Docker required (confirmed by Adobe: only the phase-1
+# validator runs natively; syntax validation and serving both need the
+# container). Uses Adobe's own docker_run.sh unmodified.
+# ---------------------------------------------------------------------------
+
+start_dispatcher() {
+  if is_running dispatcher; then
+    log "dispatcher is already running"
+    return 0
+  fi
+  command -v docker >/dev/null 2>&1 \
+    || die "Docker is required for the Dispatcher (Adobe's Dispatcher Tools are Docker-based). Start Docker/OrbStack and ensure 'docker' is on PATH."
+  ensure_dispatcher_src
+
+  # Current Dispatcher Tools releases ship native arm64 image archives
+  # alongside the amd64 ones (verified: docker_run.sh loads the arch-native
+  # tarball on its own) — no Rosetta/DOCKER_DEFAULT_PLATFORM override needed
+  # on Apple Silicon. Forcing amd64 here actively breaks it, since the
+  # amd64 image was never loaded into the local Docker image cache.
+
+  mkdir -p "$RUN_DIR" "$INSTANCES_DIR/dispatcher"
+  log "Starting dispatcher on :$DISPATCHER_PORT -> publish :$AEM_PUBLISH_PORT"
+  # Run from instances/dispatcher/ (not the repo root) — docker_run.sh
+  # writes a local cache/ folder relative to its invocation directory, and
+  # we want that alongside the other instances' state, not cluttering the
+  # repo root (DISPATCHER_SRC_DIR and DISPATCHER_TOOLS_DIR are absolute
+  # paths, so this cd doesn't affect what gets passed to it).
+  (
+    cd "$INSTANCES_DIR/dispatcher"
+    nohup "$DISPATCHER_TOOLS_DIR/bin/docker_run.sh" "$DISPATCHER_SRC_DIR" \
+      "host.docker.internal:${AEM_PUBLISH_PORT}" "${DISPATCHER_PORT}" \
+      > "$RUN_DIR/dispatcher.out" 2>&1 &
+    echo $! > "$RUN_DIR/dispatcher.pid"
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Command implementations
+# ---------------------------------------------------------------------------
+
+expand_services() {
+  local args=("$@") out=() a
+  [[ ${#args[@]} -eq 0 ]] && args=(author publish)
+  for a in "${args[@]}"; do
+    case "$a" in
+      full) out+=(author publish ues ssl dispatcher) ;;
+      *) out+=("$a") ;;
+    esac
+  done
+  echo "${out[@]}"
+}
+
+# One-click "Attach" debug configs for VS Code's Java extension, pointed
+# at the JDWP ports start_instance already opens (3<port>). Regenerated
+# from .env every `configure` so it can't drift from the real ports —
+# gitignored (.vscode/* already covers it) for the same reason .env is:
+# generated, not hand-maintained.
+render_vscode_launch() {
+  mkdir -p "$ROOT/.vscode"
+  cat > "$ROOT/.vscode/launch.json" <<EOF
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "java",
+      "request": "attach",
+      "name": "Attach: Author",
+      "hostName": "localhost",
+      "port": 3${AEM_AUTHOR_PORT}
+    },
+    {
+      "type": "java",
+      "request": "attach",
+      "name": "Attach: Publish",
+      "hostName": "localhost",
+      "port": 3${AEM_PUBLISH_PORT}
+    }
+  ]
+}
+EOF
+}
+
+cmd_configure() {
+  if [[ ! -f "$ENV_FILE" ]]; then
+    cp "$ENV_EXAMPLE" "$ENV_FILE"
+    log "Created .env from config/.env.example"
+  else
+    log ".env already exists — leaving it as is"
+  fi
+  load_env
+  mkdir -p "$RUN_DIR" "$INSTANCES_DIR"
+  ensure_quickstart_jar
+  ensure_certs
+  render_vscode_launch
+  log "Configuration complete. Run: ./aem start"
+}
+
+cmd_start() {
+  load_env
+  mkdir -p "$RUN_DIR"
+  render_vscode_launch  # keep debug ports in launch.json current even if .env changed since configure
+  local services s
+  services=$(expand_services "$@")
+  for s in $services; do
+    case "$s" in
+      author|publish) start_instance "$s" ;;
+      ues) start_ues ;;
+      ssl) start_ssl ;;
+      dispatcher) start_dispatcher ;;
+      *) die "Unknown service: $s (expected author, publish, ues, ssl, dispatcher, or full)" ;;
+    esac
+  done
+}
+
+cmd_stop() {
+  load_env
+  local services s
+  if [[ $# -eq 0 ]]; then
+    services="author publish ues ssl dispatcher"
+  else
+    services=$(expand_services "$@")
+  fi
+  for s in $services; do
+    case "$s" in
+      ssl) stop_ssl ;;
+      *) stop_service "$s" ;;
+    esac
+  done
+}
+
+cmd_restart() {
+  load_env
+  local services s
+  if [[ $# -eq 0 ]]; then
+    services=""
+    for s in author publish ues dispatcher; do
+      is_running "$s" && services="$services $s"
+    done
+    if is_running ssl-author || is_running ssl-publish; then
+      services="$services ssl"
+    fi
+    if [[ -z "$services" ]]; then
+      log "Nothing is running."
+      return 0
+    fi
+  else
+    services=$(expand_services "$@")
+  fi
+  # shellcheck disable=SC2086
+  cmd_stop $services
+  sleep 1
+  # shellcheck disable=SC2086
+  cmd_start $services
+}
+
+status_row() {
+  local label="$1" svc="$2" url="$3" state="stopped"
+  is_running "$svc" && state="running"
+  printf "%-12s %-10s %s\n" "$label" "$state" "$url"
+}
+
+cmd_status() {
+  load_env
+  printf "%-12s %-10s %s\n" "SERVICE" "STATUS" "URL"
+  status_row "Author" author "http://localhost:${AEM_AUTHOR_PORT}"
+  status_row "Publish" publish "http://localhost:${AEM_PUBLISH_PORT}"
+  status_row "Dispatcher" dispatcher "http://localhost:${DISPATCHER_PORT}"
+  status_row "UES" ues "https://localhost:${UES_PORT}"
+  local ssl_state="stopped"
+  { is_running ssl-author || is_running ssl-publish; } && ssl_state="running"
+  printf "%-12s %-10s %s\n" "SSL" "$ssl_state" "https://localhost:${SSL_AUTHOR_PORT} (author), https://localhost:${SSL_PUBLISH_PORT} (publish)"
+}
+
+cmd_logs() {
+  load_env
+  local svc="${1:-}"
+  [[ -z "$svc" ]] && die "Usage: ./aem logs <author|publish|dispatcher|ues|ssl-author|ssl-publish> [-f]"
+  shift || true
+  local follow="false"
+  [[ "${1:-}" == "-f" ]] && follow="true"
+
+  local logfile
+  case "$svc" in
+    author|publish) logfile="$INSTANCES_DIR/$svc/crx-quickstart/logs/error.log" ;;
+    dispatcher|ues|ssl-author|ssl-publish) logfile="$RUN_DIR/${svc}.out" ;;
+    *) die "Unknown service: $svc" ;;
+  esac
+
+  [[ -f "$logfile" ]] || die "No log yet for $svc (expected $logfile) — has it been started?"
+  if [[ "$follow" == "true" ]]; then
+    tail -f "$logfile"
+  else
+    tail -n 200 "$logfile"
+  fi
+}
+
+reset_tier() {
+  local tier="$1"
+  stop_service "$tier"
+  local cq="$INSTANCES_DIR/$tier/crx-quickstart"
+  if [[ -d "$cq" ]]; then
+    log "Clearing $cq"
+    # In Docker mode $cq is a named-volume mountpoint: `rm -rf "$cq"` fails
+    # with "Device or resource busy" trying to remove the mountpoint entry
+    # itself. Empty its contents instead — works the same way whether $cq
+    # is a mountpoint (Docker) or a plain directory (native).
+    find "$cq" -mindepth 1 -delete
+  fi
+  log "$tier reset. Run './aem start $tier' to bootstrap a fresh instance (OSGi configs are reapplied automatically)."
+}
+
+cmd_reset() {
+  load_env
+  local target="${1:-}"
+  case "$target" in
+    author|publish) reset_tier "$target" ;;
+    all) reset_tier author; reset_tier publish ;;
+    *) die "Usage: ./aem reset <author|publish|all>" ;;
+  esac
+}
+
+cmd_shell() {
+  load_env
+  local svc="${1:-author}"
+  case "$svc" in
+    author|publish)
+      log "Opening a shell in instances/$svc"
+      ( cd "$INSTANCES_DIR/$svc" && exec "${SHELL:-/bin/bash}" )
+      ;;
+    dispatcher)
+      command -v docker >/dev/null 2>&1 || die "Docker is required."
+      local cid
+      cid=$(docker ps --filter "publish=${DISPATCHER_PORT}" -q | head -1)
+      [[ -z "$cid" ]] && die "No running dispatcher container found on port ${DISPATCHER_PORT}. Check: docker ps"
+      docker exec -it "$cid" /bin/sh
+      ;;
+    *) die "Usage: ./aem shell <author|publish|dispatcher>" ;;
+  esac
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: ./aem <command> [args]
+
+  configure                 One-time (idempotent) setup: .env, SDK detection, certs
+  start [service...|full]   Start services. Default: author publish. 'full' = author publish ues ssl dispatcher
+  stop [service...]         Stop services. No args = stop everything running
+  restart [service...]      Restart services. No args = restart whatever is currently running
+  status                    Show what's running and on which ports/URLs
+  logs <service> [-f]       Tail a service's real log (author, publish, dispatcher, ues, ssl-author, ssl-publish)
+  reset <author|publish|all>  Wipe an instance's crx-quickstart (never touches sdk/, config/, or .env)
+  shell <author|publish|dispatcher>  Open a shell in the instance dir, or exec into the dispatcher container
+
+Services: author publish dispatcher ues ssl full
+USAGE
+}
+
+main() {
+  local cmd="${1:-}"
+  [[ $# -gt 0 ]] && shift || true
+  case "$cmd" in
+    configure) cmd_configure "$@" ;;
+    start)     cmd_start "$@" ;;
+    stop)      cmd_stop "$@" ;;
+    restart)   cmd_restart "$@" ;;
+    status)    cmd_status "$@" ;;
+    logs)      cmd_logs "$@" ;;
+    reset)     cmd_reset "$@" ;;
+    shell)     cmd_shell "$@" ;;
+    ""|help|-h|--help) usage ;;
+    *) err "Unknown command: $cmd"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"

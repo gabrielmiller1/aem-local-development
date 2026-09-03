@@ -1,0 +1,38 @@
+# Local configuration (copy from config/.env.example)
+.env
+
+# Adobe AEM SDK — proprietary, never commit
+sdk/*.zip
+sdk/*.jar
+sdk/*.sh
+sdk/.extracted/
+sdk/dispatcher-tools/
+
+# Universal Editor Service — proprietary, never commit
+ues/*.zip
+ues/*.cjs
+ues/.extracted/
+
+# Generated instance state (crx-quickstart, pid/log files, dispatcher cache, etc.)
+instances/
+cache/
+
+# Generated dispatcher config (rendered from dispatcher/ + .env)
+dispatcher/src/
+
+# TLS certificates / private keys — never commit
+certs/
+*.pem
+*.key
+*.crt
+
+# OS cruft
+.DS_Store
+
+# Editor cruft
+.vscode/*
+!.vscode/extensions.json
+
+# Personal notes — not part of the published project
+COMO-FUNCIONA.md
+*.bak

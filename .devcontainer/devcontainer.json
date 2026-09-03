@@ -1,0 +1,46 @@
+{
+  "name": "AEM Local Development",
+  "image": "mcr.microsoft.com/devcontainers/base:debian",
+
+  // Named volumes (below) are created root-owned by Docker by default, and
+  // docker-in-docker needs access to the Docker socket. Running the
+  // container as root avoids both classes of permission friction — this
+  // is a disposable local dev container, not a shared/multi-tenant one.
+  "remoteUser": "root",
+
+  "postStartCommand": "git config --global --add safe.directory ${containerWorkspaceFolder}",
+
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "configureZshAsDefaultShell": true
+    },
+    "ghcr.io/devcontainers/features/java:1": {
+      "version": "21",
+      "jdkDistro": "tem",
+      "installMaven": true
+    },
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "20"
+    },
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "moby": false
+    }
+  },
+
+  "mounts": [
+    {
+      "source": "aem-local-author-${devcontainerId}",
+      "target": "${containerWorkspaceFolder}/instances/author/crx-quickstart",
+      "type": "volume"
+    },
+    {
+      "source": "aem-local-publish-${devcontainerId}",
+      "target": "${containerWorkspaceFolder}/instances/publish/crx-quickstart",
+      "type": "volume"
+    }
+  ],
+
+  "forwardPorts": [4502, 34502, 4503, 34503, 8080, 8000, 8443, 8444],
+
+  "postCreateCommand": "./aem configure"
+}
